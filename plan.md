@@ -443,17 +443,52 @@ flowchart LR
 
 ## Phase 5: Video-RAG Runtime Enhancement
 
+> **Key insight** ([source](https://www.reddit.com/r/Rag/comments/1psy4g0/lessons_from_integrating_rag_with_ai_video/)): Video models ignore appended RAG context — they are trained on scene descriptions, not fact extraction. Appending retrieved chunks to the prompt causes hallucination. The fix is an **LLM prompt rewrite step** that bakes retrieved facts directly into the scene description before the video model sees it.
+
 ### Step 5.1 — Extend Existing RAG Pipeline
 - Build on the existing `rag/index_data.py` and `rag/query.py` infrastructure
 - Add video-specific indexing: store per-video metadata from Falcon labels (Step 2.2-2.3) in ChromaDB
 - New document types: scene descriptions, object inventories, motion patterns, style tags
 
-### Step 5.2 — Video-RAG Query Interface
-- At generation time, user prompt is embedded and matched against the video knowledge base
-- Retrieved "scene priors" (object layouts, motion patterns, style references) are injected into the model's cross-attention conditioning
-- This enables domain-specific video generation WITHOUT retraining (e.g., "generate a video of our specific factory floor layout")
+### Step 5.2 — LLM Prompt Rewrite Step (critical)
+Video generation models do **not** reason over appended context the way LLMs do. Raw context injection fails silently — the model generates plausible-looking but factually wrong video.
 
-### Step 5.3 — Brand/Asset Injection
+**Pattern: LLM-mediated prompt rewriting**
+1. User submits a generation prompt (e.g., *"Video of a person explaining our product pricing"*)
+2. RAG retrieves relevant facts from ChromaDB (e.g., *"Pro plan is $269, Starter is $199"*)
+3. An LLM (BitNet text model or external) **rewrites** the prompt with facts baked into the scene description:
+   - Before: *"Video of a person explaining our product pricing"*
+   - After: *"Video of a person looking at the camera saying the Pro plan costs $269 and the Starter plan costs $199, with on-screen lower-third text showing both prices"*
+4. The rewritten prompt — not the raw context — is sent to the video generation model
+
+**Why this works**: The video model treats the entire prompt as a scene description. Facts embedded in scene language ("a sign reading $269") are rendered; facts appended as data ("Context: price=$269") are ignored.
+
+### Step 5.3 — Make Facts Renderable
+Bind retrieved facts to visually grounded elements to maximize adherence:
+- **On-screen text**: *"lower-third text overlay showing: Complete $269"*
+- **Props**: *"a pricing chart on the whiteboard behind the speaker"*
+- **Structured micro-specs**: Have the rewrite LLM output a constrained schema:
+  ```json
+  {
+    "scene_description": "person explaining pricing at a desk",
+    "on_screen_text": ["Pro: $269", "Starter: $199"],
+    "props": ["pricing_chart", "product_box"],
+    "spoken_facts": ["Pro plan costs $269", "Starter costs $199"]
+  }
+  ```
+- This reduces degrees of freedom and lowers the hallucination rate
+
+### Step 5.4 — Verification Loop
+For factual accuracy (pricing, legal claims, brand names), add a post-generation verification step:
+1. Run **ASR** (speech-to-text) on the generated video audio
+2. Run **Falcon OCR** on rendered frames to extract on-screen text
+3. Compare extracted facts against the original RAG-retrieved ground truth
+4. If verification fails → regenerate with a more constrained rewrite
+5. Log pass/fail rates to track factual accuracy over time
+
+This automated check is essential because even a small hallucination rate is unacceptable for pricing, legal, or brand-critical content.
+
+### Step 5.5 — Brand/Asset Injection
 - Store brand assets (logos, color palettes, character reference images) in the RAG vector store
 - At inference, retrieved brand assets are fed through the CLIP image encoder and injected as additional conditioning
 - Uses V-RAG pattern: retrieval → encode → condition → generate
@@ -471,20 +506,32 @@ flowchart TB
         BRANDS["Brand Assets\nLogos, Palettes"] --> CHROMA
     end
 
-    subgraph ONLINE["Online: Generation-Time Retrieval"]
-        PROMPT["User Prompt"] --> EMBED2["Embed Query"]
+    subgraph ONLINE["Online: Generation-Time Pipeline"]
+        PROMPT["User Prompt:\n'Video about product pricing'"] --> EMBED2["Embed Query"]
         EMBED2 --> SEARCH["ChromaDB\nSimilarity Search\ntop-k=3"]
         CHROMA --> SEARCH
-        SEARCH --> PRIORS["Retrieved Scene Priors\n+ Style References"]
-        PRIORS --> ENCODE["CLIP Encode\nBrand Assets"]
-        PRIORS --> CONDITION["Inject into\nCross-Attention\nConditioning"]
-        ENCODE --> CONDITION
-        CONDITION --> BITNET["BitNet-Video\nDenoise Pipeline"]
-        BITNET --> OUT["🎬 Domain-Specific\nVideo Output"]
+        SEARCH --> FACTS["Retrieved Facts:\n'Pro=$269, Starter=$199'"]
+
+        PROMPT --> REWRITE
+        FACTS --> REWRITE["⚡ LLM Prompt Rewrite\n(BitNet text model)\nBake facts INTO scene description"]
+
+        REWRITE --> REWRITTEN["Rewritten Prompt:\n'Person at desk explaining\nPro plan at $269 with\nlower-third price overlay'"]
+
+        REWRITTEN --> BITNET["BitNet-Video\nDenoise Pipeline"]
+        BRANDS --> CLIP["CLIP Encode\nBrand Assets"]
+        CLIP --> BITNET
+        BITNET --> VIDEO["🎬 Generated Video"]
+
+        VIDEO --> VERIFY{"Verification Loop"}
+        VERIFY -->|"ASR + Falcon OCR\nextract facts"| CHECK["Compare vs\nGround Truth"]
+        CHECK -->|"✅ Pass"| OUT["🎬 Final Output"]
+        CHECK -->|"❌ Fail"| REWRITE
     end
 
     style OFFLINE fill:#16213e,stroke:#0f3460,color:#fff
     style ONLINE fill:#1a1a2e,stroke:#e94560,color:#fff
+    style REWRITE fill:#e94560,stroke:#333,color:#fff
+    style VERIFY fill:#0f3460,stroke:#e94560,color:#fff
 ```
 
 ---
