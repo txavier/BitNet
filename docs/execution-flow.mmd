@@ -1,0 +1,50 @@
+flowchart TD
+    subgraph SETUP["setup_env.py (Build & Prepare)"]
+        A[parse_args] --> B[main]
+        B --> C[setup_gguf]
+        C -->|pip install gguf-py| C1[Install 3rdparty/llama.cpp/gguf-py]
+        B --> D[gen_code]
+        D --> D1{Detect CPU arch}
+        D1 -->|ARM| D2[codegen_tl1.py]
+        D1 -->|x86_64| D3[codegen_tl2.py]
+        D2 --> D4[Generate bitnet-lut-kernels.h]
+        D3 --> D4
+        D4 --> D5{Use pretuned?}
+        D5 -->|Yes| D6[Copy preset_kernels/ headers]
+        D5 -->|No| D7[Generate fresh kernels]
+        B --> E[compile]
+        E --> E1["cmake -B build (generate build files)"]
+        E1 --> E2["cmake --build build (compile C++)"]
+        E2 --> E3[Build binaries in build/bin/]
+        B --> F[prepare_model]
+        F --> F1{Source?}
+        F1 -->|HF repo| F2[huggingface-cli download]
+        F1 -->|Local dir| F3[Load from model_dir]
+        F2 --> F4{GGUF exists?}
+        F3 --> F4
+        F4 -->|No| F5{Quant type?}
+        F4 -->|Yes| F6[Skip conversion]
+        F5 -->|tl1/tl2| F7[convert-hf-to-gguf-bitnet.py<br/>with --outtype tl]
+        F5 -->|i2_s| F8[convert-hf-to-gguf-bitnet.py<br/>--outtype f32]
+        F8 --> F9[llama-quantize → i2_s GGUF]
+        F7 --> F10[ggml-model-*.gguf]
+        F9 --> F10
+    end
+
+    subgraph INFER["run_inference.py (CLI Inference)"]
+        G[parse_args] --> H[run_inference]
+        H --> I["build/bin/llama-cli"]
+        I --> I1["-m model.gguf<br/>-n tokens -t threads<br/>-p prompt -ngl 0 -b 1"]
+        I1 --> I2{--conversation?}
+        I2 -->|Yes| I3[Chat mode -cnv]
+        I2 -->|No| I4[Text completion]
+    end
+
+    subgraph SERVER["run_inference_server.py (HTTP Server)"]
+        J[parse_args] --> K[run_server]
+        K --> L["build/bin/llama-server"]
+        L --> L1["-m model.gguf<br/>--host --port<br/>-cb continuous batching"]
+    end
+
+    SETUP -->|"Produces GGUF model<br/>& compiled binaries"| INFER
+    SETUP -->|"Produces GGUF model<br/>& compiled binaries"| SERVER
