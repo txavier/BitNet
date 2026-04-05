@@ -1,0 +1,6 @@
+[
+  {"text": "The Saab 9000 was produced from 1984 to 1998. The turbocharged 2.0L engine produced 150 hp, while the 2.3L turbo made 200 hp. The Aero variant had a 2.3L turbo producing 225 hp."},
+  {"text": "BitNet b1.58 is a 1-bit large language model where every weight is ternary: -1, 0, or 1. It matches full-precision transformer performance while being significantly more efficient for inference."},
+  {"text": "The ASUS TUF GeForce RTX 5070 Ti features 16GB of GDDR7 memory, based on NVIDIA's Blackwell architecture, with approximately 22 TFLOPS of fp16 performance."},
+  {"text": "Retrieval-Augmented Generation (RAG) combines a retrieval system with a language model. The retriever fetches relevant documents from a knowledge base, which are then provided as context to the LLM for generating accurate answers."}
+]
