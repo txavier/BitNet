@@ -2,13 +2,17 @@ import json
 import csv
 import os
 import sys
+import shutil
 import argparse
 import chromadb
 from sentence_transformers import SentenceTransformer
 
 
 def load_documents(data_path):
-    """Load documents from a JSON, JSONL, CSV, or plain text file."""
+    """Load documents from a file or directory of files."""
+    if os.path.isdir(data_path):
+        return load_directory(data_path)
+
     documents = []
     ext = os.path.splitext(data_path)[1].lower()
 
@@ -37,15 +41,90 @@ def load_documents(data_path):
                 text = row.get("text") or row.get("content") or " ".join(row.values())
                 documents.append(text)
 
-    elif ext == ".txt":
-        with open(data_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    documents.append(line)
+    elif ext in (".txt", ".md"):
+        documents.extend(load_text_file(data_path))
 
     else:
         print(f"Unsupported file format: {ext}")
+        sys.exit(1)
+
+    return documents
+
+
+def load_text_file(file_path):
+    """Load a text or markdown file, splitting into sections."""
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    ext = os.path.splitext(file_path)[1].lower()
+    filename = os.path.basename(file_path)
+
+    if ext == ".md":
+        # Split markdown by headings to create meaningful chunks
+        sections = []
+        current_section = []
+        current_heading = filename
+
+        for line in content.split("\n"):
+            if line.startswith("#"):
+                # Save previous section if it has content
+                text = "\n".join(current_section).strip()
+                if text:
+                    sections.append(f"[{filename}] {current_heading}\n{text}")
+                current_heading = line.lstrip("#").strip()
+                current_section = []
+            else:
+                current_section.append(line)
+
+        # Save last section
+        text = "\n".join(current_section).strip()
+        if text:
+            sections.append(f"[{filename}] {current_heading}\n{text}")
+
+        return [s for s in sections if len(s.strip()) > 20]
+    else:
+        return [line.strip() for line in content.split("\n") if line.strip()]
+
+
+def load_directory(dir_path):
+    """Load all supported files from a directory, jsonify them, and move originals."""
+    supported_extensions = {".json", ".jsonl", ".csv", ".txt", ".md"}
+    documents = []
+
+    # Set up jsonified directories
+    jsonified_dir = os.path.join(dir_path, "jsonified")
+    original_dir = os.path.join(jsonified_dir, "original")
+    os.makedirs(jsonified_dir, exist_ok=True)
+    os.makedirs(original_dir, exist_ok=True)
+
+    files = sorted(os.listdir(dir_path))
+    for filename in files:
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in supported_extensions:
+            continue
+        file_path = os.path.join(dir_path, filename)
+        if not os.path.isfile(file_path):
+            continue
+
+        print(f"  Loading {filename}...")
+        docs = load_documents(file_path)
+        documents.extend(docs)
+
+        # Save JSON representation
+        json_filename = os.path.splitext(filename)[0] + ".json"
+        json_path = os.path.join(jsonified_dir, json_filename)
+        json_data = [{"source": filename, "index": i, "text": doc} for i, doc in enumerate(docs)]
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, indent=2, ensure_ascii=False)
+        print(f"    -> Saved JSON: jsonified/{json_filename} ({len(docs)} chunks)")
+
+        # Move original file to jsonified/original/
+        original_dest = os.path.join(original_dir, filename)
+        shutil.move(file_path, original_dest)
+        print(f"    -> Moved original: jsonified/original/{filename}")
+
+    if not documents:
+        print(f"No supported files found in {dir_path}")
         sys.exit(1)
 
     return documents
