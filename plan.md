@@ -3,6 +3,59 @@
 ## TL;DR
 Build a 1.58-bit ternary video generation model by transplanting BitLinear layers into the Wan 2.2 architecture (using Wan 2.1 training recipes as reference), then deploying on a Kubernetes CPU cluster instead of GPUs. The TI2V-5B model is the primary target — smallest Wan model with the best compression ratio, already consumer-hardware-friendly. Knowledge distillation from the full-precision Wan 2.2 teacher drastically reduces training time. Falcon Perception/OCR handles automated data labeling; Video-RAG provides runtime customization without retraining.
 
+### Project Overview
+
+```mermaid
+flowchart TB
+    subgraph Phase0["Phase 0: Infrastructure"]
+        K8S["K8s CPU Cluster\n4-16 nodes"]
+        IMAGES["Container Images\nbitnet-base | wan-ref | falcon"]
+        MODELS["Pre-trained Models\nWan2.2-TI2V-5B | Wan2.2-VAE\nT5 | Falcon Perception/OCR"]
+    end
+
+    subgraph Phase1["Phase 1: Architecture"]
+        STUDY["Study Wan 2.2 DiT Blocks"] --> BITLINEAR["Define BitLinearVideo Module"]
+        BITLINEAR --> REPLACE["Replace nn.Linear → BitLinear\nin Q/K/V, FFN, Cross-Attn"]
+    end
+
+    subgraph Phase2["Phase 2: Data Pipeline"]
+        RAW["Raw Video Collection\nPanda-70M + Synthetic"] --> FALCON["Falcon Perception + OCR\nLabeling"]
+        FALCON --> CAPTIONS["Caption Generation"]
+        RAW --> VAE_ENC["Wan2.2-VAE\nPre-encoding (64x)"]
+    end
+
+    subgraph Phase3["Phase 3: Training"]
+        TEACHER["Teacher: Wan 2.2 TI2V-5B\n(frozen, bfloat16)"] --> DISTILL["Knowledge Distillation\nL_task + L_kd + L_feat"]
+        STUDENT["Student: BitNet-Video\n(1.58-bit ternary)"] --> DISTILL
+        DISTILL --> TRAINED["Trained BitNet-Video Model"]
+    end
+
+    subgraph Phase4["Phase 4: Inference"]
+        TURBO["TurboQuant\nKV Cache 6x Compression"] --> KERNELS["CPU Kernel Codegen\nTL1/TL2 for video dims"]
+        KERNELS --> GGUF["GGUF Export\nI2_S quantization"]
+        GGUF --> DEPLOY["K8s Inference Pods\nText→Denoise→VAE Decode"]
+    end
+
+    subgraph Phase5["Phase 5: Video-RAG"]
+        INDEX["Index Falcon Labels\nin ChromaDB"] --> QUERY["Scene Prior Retrieval"]
+        QUERY --> INJECT["Cross-Attention\nConditioning"]
+    end
+
+    Phase0 --> Phase1
+    Phase0 --> Phase2
+    Phase1 --> Phase3
+    Phase2 --> Phase3
+    Phase3 --> Phase4
+    Phase4 --> Phase5
+
+    style Phase0 fill:#1a1a2e,stroke:#e94560,color:#fff
+    style Phase1 fill:#16213e,stroke:#0f3460,color:#fff
+    style Phase2 fill:#1a1a2e,stroke:#e94560,color:#fff
+    style Phase3 fill:#16213e,stroke:#0f3460,color:#fff
+    style Phase4 fill:#1a1a2e,stroke:#e94560,color:#fff
+    style Phase5 fill:#16213e,stroke:#0f3460,color:#fff
+```
+
 ---
 
 ## Phase 0: Foundation & Infrastructure
@@ -24,6 +77,51 @@ Build a 1.58-bit ternary video generation model by transplanting BitLinear layer
 - Wan2.2-VAE (4×16×16 compression ratio = 64x, kept in full precision)
 - T5 text encoder (kept frozen, full precision)
 - Falcon Perception 0.6B + Falcon OCR from Hugging Face (TII)
+
+### K8s Cluster Architecture
+
+```mermaid
+flowchart TB
+    LB["LoadBalancer\nIngress Controller"] --> NS
+
+    subgraph NS["Namespace: bitnet-video"]
+        direction TB
+
+        subgraph STORAGE["Shared Storage (NFS/Ceph)"]
+            PV_MODELS[("PVC: model-weights\nWan2.2-TI2V-5B\nWan2.2-VAE, T5")]
+            PV_DATA[("PVC: training-data\nLatents + Captions")]
+            PV_CKPT[("PVC: checkpoints")]
+        end
+
+        subgraph TRAIN["Training Jobs (Volcano/KubeFlow)"]
+            W1["Worker Pod 1\n32 CPU cores"]
+            W2["Worker Pod 2\n32 CPU cores"]
+            W3["Worker Pod ..."]
+            WN["Worker Pod N\n32 CPU cores"]
+        end
+
+        subgraph LABEL["Labeling Batch Jobs"]
+            FP["Falcon Perception\n0.6B Pods"]
+            FO["Falcon OCR\nPods"]
+        end
+
+        subgraph INFER["Inference Deployment + HPA"]
+            T5P["T5 Encoder Pod"]
+            DP1["Denoise Pod 1"]
+            DP2["Denoise Pod 2"]
+            VAEP["VAE Decode Pod"]
+        end
+    end
+
+    W1 & W2 & W3 & WN --> PV_DATA
+    W1 & W2 & W3 & WN --> PV_CKPT
+    W1 <-->|"All-Reduce\nGloo/TCP"| W2
+    W2 <-->|"All-Reduce\nGloo/TCP"| WN
+    FP & FO --> PV_DATA
+    T5P --> DP1 & DP2
+    DP1 & DP2 --> VAEP
+    INFER --> PV_MODELS
+```
 
 ---
 
@@ -51,7 +149,55 @@ Build a 1.58-bit ternary video generation model by transplanting BitLinear layer
 - Keep the activation quantization strategy: per-token scaling to int8 via `s = 127 / max(|input|)`
 
 ### Step 1.3 — Replace Linear Layers in Wan DiT
-**Replace with BitLinear:**
+
+```mermaid
+flowchart LR
+    subgraph WAN["Wan 2.2 DiT Block (original)"]
+        direction TB
+        IN1["Input Latent"] --> NORM1["RMSNorm"]
+        NORM1 --> QKV1["nn.Linear\nQ, K, V"]
+        QKV1 --> ATTN1["Spatio-Temporal\nAttention"]
+        ATTN1 --> OUT1["nn.Linear\nOutput Proj"]
+        OUT1 --> ADD1(("+ Residual"))
+        ADD1 --> NORM2["RMSNorm"]
+        NORM2 --> FFN1["nn.Linear\nSwiGLU FFN"]
+        FFN1 --> ADD2(("+ Residual"))
+
+        T_EMB1["Time Embedding"] --> MLP1["nn.Linear\n+ SiLU"]
+        MLP1 -->|"modulation"| NORM1 & NORM2
+
+        TXT1["T5 Text Embeddings"] --> XATTN1["nn.Linear\nCross-Attn"]
+        XATTN1 --> ATTN1
+    end
+
+    subgraph BIT["BitNet-Video DiT Block (modified)"]
+        direction TB
+        IN2["Input Latent"] --> BNORM1["RMSNorm"]
+        BNORM1 --> BQKV["🔶 BitLinear\nQ, K, V"]
+        BQKV --> BATTN["Spatio-Temporal\nAttention"]
+        BATTN --> BOUT["🔶 BitLinear\nOutput Proj"]
+        BOUT --> BADD1(("+ Residual"))
+        BADD1 --> BNORM2["RMSNorm"]
+        BNORM2 --> BFFN["🔶 BitLinear\nSwiGLU FFN"]
+        BFFN --> BADD2(("+ Residual"))
+
+        T_EMB2["Time Embedding"] --> BMLP["🔶 BitLinear\n+ SiLU"]
+        BMLP -->|"modulation"| BNORM1 & BNORM2
+
+        TXT2["T5 Text Embeddings"] --> BXATTN["🔶 BitLinear\nCross-Attn"]
+        BXATTN --> BATTN
+    end
+
+    WAN -->|"Replace nn.Linear\nwith BitLinear"| BIT
+
+    style BQKV fill:#e94560,stroke:#333,color:#fff
+    style BOUT fill:#e94560,stroke:#333,color:#fff
+    style BFFN fill:#e94560,stroke:#333,color:#fff
+    style BMLP fill:#e94560,stroke:#333,color:#fff
+    style BXATTN fill:#e94560,stroke:#333,color:#fff
+```
+
+**Replace with BitLinear (🔶 highlighted above):**
 - All Q, K, V projections in self-attention (spatio-temporal)
 - Output projection of attention heads
 - Cross-attention linear layers (text conditioning)
@@ -107,6 +253,39 @@ Build a 1.58-bit ternary video generation model by transplanting BitLinear layer
 - Store encoded latents in shared PV — the BitNet transformer trains on these, not raw pixels
 - This is a one-time cost; the VAE is frozen thereafter
 
+### Data Pipeline Flow
+
+```mermaid
+flowchart LR
+    subgraph COLLECT["Step 2.1: Collection"]
+        PANDA["Panda-70M\n2M Subset"] --> RAW[("Raw Videos\n500K-2M clips")]
+        SYNTH["Wan 2.2 A14B\nSynthetic Gen"] --> RAW
+    end
+
+    subgraph LABEL["Steps 2.2-2.4: Labeling (parallel)"]
+        RAW --> KF["Extract\nKeyframes\n1/sec"]
+        KF --> FP["Falcon Perception 0.6B\n• Object Detection\n• Spatial Graphs\n• Scene Descriptions"]
+        KF --> FO["Falcon OCR\n• On-screen Text\n• Signs, UI"]
+        FP --> MERGE["Merge\nAnnotations"]
+        FO --> MERGE
+        MERGE --> CAP["Caption Synthesis\n→ Natural Language"]
+    end
+
+    subgraph ENCODE["Step 2.5: VAE Encoding"]
+        RAW --> WAE["Wan2.2-VAE Encoder\n4×16×16 = 64x compression"]
+        WAE --> LAT[("Latent\nRepresentations")]
+    end
+
+    subgraph OUTPUT["Training Dataset"]
+        CAP --> DS[("Per-clip JSON:\nvideo_path, caption,\nframe_annotations,\nocr_data, duration")]
+        LAT --> DS
+    end
+
+    style FP fill:#0f3460,stroke:#e94560,color:#fff
+    style FO fill:#0f3460,stroke:#e94560,color:#fff
+    style WAE fill:#16213e,stroke:#0f3460,color:#fff
+```
+
 ---
 
 ## Phase 3: Training — Knowledge Distillation on K8s
@@ -152,6 +331,52 @@ Build a 1.58-bit ternary video generation model by transplanting BitLinear layer
 
 *These are rough estimates. Without distillation (training from scratch), multiply by 5-10x.*
 
+### Knowledge Distillation Architecture
+
+```mermaid
+flowchart TB
+    DATA[("Training Data\nVAE-encoded Latents\n+ Captions")] --> BATCH["Data Loader\n(sharded across pods)"]
+
+    BATCH --> TEACHER
+    BATCH --> STUDENT
+
+    subgraph TEACHER["Teacher (Frozen)"]
+        T_MODEL["Wan 2.2 TI2V-5B\nbfloat16 — full precision"]
+        T_MODEL --> T_ATTN["Attention\nDistributions"]
+        T_MODEL --> T_FEAT["Intermediate\nFeature Maps"]
+        T_MODEL --> T_PRED["Noise\nPrediction"]
+    end
+
+    subgraph STUDENT["Student (Training)"]
+        S_MODEL["BitNet-Video\n1.58-bit ternary weights\nBF16 master weights"]
+        S_MODEL --> S_ATTN["Attention\nDistributions"]
+        S_MODEL --> S_FEAT["Intermediate\nFeature Maps"]
+        S_MODEL --> S_PRED["Noise\nPrediction"]
+    end
+
+    subgraph LOSS["Combined Loss"]
+        T_PRED & S_PRED --> L_TASK["L_task\nFlow-matching loss"]
+        T_ATTN & S_ATTN --> L_KD["L_kd\nKL Divergence"]
+        T_FEAT & S_FEAT --> L_FEAT["L_feat\nMSE"]
+        L_TASK & L_KD & L_FEAT --> TOTAL["L = α·L_task + β·L_kd + γ·L_feat"]
+    end
+
+    TOTAL --> GRAD["Backprop → Update\nBF16 Master Weights"]
+    GRAD --> S_MODEL
+
+    subgraph K8S["K8s Pod Topology"]
+        direction LR
+        POD1["Pod 1\n32 cores"] <-->|"All-Reduce\nGloo/TCP"| POD2["Pod 2\n32 cores"]
+        POD2 <-->|"All-Reduce\nGloo/TCP"| POD3["Pod N\n32 cores"]
+    end
+
+    GRAD --> K8S
+
+    style TEACHER fill:#16213e,stroke:#0f3460,color:#fff
+    style STUDENT fill:#1a1a2e,stroke:#e94560,color:#fff
+    style LOSS fill:#0a0a1a,stroke:#e94560,color:#fff
+```
+
 ---
 
 ## Phase 4: Inference Optimization
@@ -182,6 +407,38 @@ Build a 1.58-bit ternary video generation model by transplanting BitLinear layer
   4. **VAE Decode Pod**: Wan2.2-VAE decodes latents → outputs video
 - Load balancer distributes generation requests across pod replicas
 
+### Inference Pipeline
+
+```mermaid
+flowchart LR
+    USER["User Request\n'A cat surfing\non a beach'"] --> API["API Gateway\nK8s Ingress"]
+
+    API --> T5["T5 Encoder Pod\n(frozen, full precision)\n→ text embeddings"]
+    API -->|"optional\nreference image"| CLIP["CLIP Encoder Pod\n→ image embeddings"]
+
+    T5 --> DENOISE
+    CLIP -.-> DENOISE
+
+    subgraph DENOISE["Denoise Pod Pool (BitNet-Video 1.58-bit)"]
+        direction TB
+        NOISE["Random Latent\nNoise z_T"] --> STEP["Flow Matching\nDenoising Steps\n(40-50 steps)"]
+        STEP -->|"TurboQuant\n6x KV cache\ncompression"| CLEAN["Denoised\nLatent z_0"]
+    end
+
+    CLEAN --> VAE["VAE Decode Pod\nWan2.2-VAE (float32)\nLatent → Pixels"]
+    VAE --> VIDEO["🎬 Output Video\n720P @ 24fps\n5 seconds"]
+
+    subgraph VRAG["Video-RAG (optional)"]
+        CHROMA[("ChromaDB\nScene Priors\nBrand Assets")]
+    end
+
+    API --> VRAG
+    VRAG -->|"retrieved scene priors\ninjected as conditioning"| DENOISE
+
+    style DENOISE fill:#1a1a2e,stroke:#e94560,color:#fff
+    style VRAG fill:#16213e,stroke:#0f3460,color:#fff
+```
+
 ---
 
 ## Phase 5: Video-RAG Runtime Enhancement
@@ -200,6 +457,35 @@ Build a 1.58-bit ternary video generation model by transplanting BitLinear layer
 - Store brand assets (logos, color palettes, character reference images) in the RAG vector store
 - At inference, retrieved brand assets are fed through the CLIP image encoder and injected as additional conditioning
 - Uses V-RAG pattern: retrieval → encode → condition → generate
+
+### Video-RAG Flow
+
+```mermaid
+flowchart TB
+    subgraph OFFLINE["Offline: Indexing (extends existing rag/)"]
+        FDATA["Falcon-labeled\nVideo Metadata"] --> EMBED1["SentenceTransformer\nall-MiniLM-L6-v2"]
+        EMBED1 --> CHROMA[("ChromaDB\nCollections:")]
+        SCENES["Scene Descriptions"] --> CHROMA
+        OBJECTS["Object Inventories"] --> CHROMA
+        MOTION["Motion Patterns"] --> CHROMA
+        BRANDS["Brand Assets\nLogos, Palettes"] --> CHROMA
+    end
+
+    subgraph ONLINE["Online: Generation-Time Retrieval"]
+        PROMPT["User Prompt"] --> EMBED2["Embed Query"]
+        EMBED2 --> SEARCH["ChromaDB\nSimilarity Search\ntop-k=3"]
+        CHROMA --> SEARCH
+        SEARCH --> PRIORS["Retrieved Scene Priors\n+ Style References"]
+        PRIORS --> ENCODE["CLIP Encode\nBrand Assets"]
+        PRIORS --> CONDITION["Inject into\nCross-Attention\nConditioning"]
+        ENCODE --> CONDITION
+        CONDITION --> BITNET["BitNet-Video\nDenoise Pipeline"]
+        BITNET --> OUT["🎬 Domain-Specific\nVideo Output"]
+    end
+
+    style OFFLINE fill:#16213e,stroke:#0f3460,color:#fff
+    style ONLINE fill:#1a1a2e,stroke:#e94560,color:#fff
+```
 
 ---
 
