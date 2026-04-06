@@ -5,6 +5,23 @@ import requests
 import chromadb
 from sentence_transformers import SentenceTransformer
 
+DEFAULT_CHROMA_SERVER = "http://localhost:8000"
+
+
+def _connect_chroma(chroma_server=DEFAULT_CHROMA_SERVER, db_path="rag/chroma_db"):
+    """Connect to ChromaDB server with automatic fallback to local storage."""
+    if chroma_server:
+        try:
+            client = chromadb.HttpClient(host=chroma_server)
+            client.heartbeat()
+            print(f"Connected to ChromaDB server at {chroma_server}")
+            return client
+        except Exception:
+            print(f"  ChromaDB server at {chroma_server} not reachable, falling back to local storage...")
+
+    print(f"Using local ChromaDB at {db_path}")
+    return chromadb.PersistentClient(path=db_path)
+
 
 def retrieve(query, collection, model, top_k=3):
     """Retrieve the most relevant documents for a query."""
@@ -112,7 +129,10 @@ if __name__ == "__main__":
     parser.add_argument("-q", "--query", type=str, help="Single question to ask (omit for interactive mode)")
     parser.add_argument("--server-url", type=str, default="http://127.0.0.1:8080", help="BitNet server URL")
     parser.add_argument("--collection", type=str, default="bitnet_rag", help="ChromaDB collection name")
-    parser.add_argument("--db-path", type=str, default="rag/chroma_db", help="Path to ChromaDB")
+    parser.add_argument("--db-path", type=str, default="rag/chroma_db", help="Local ChromaDB fallback path")
+    parser.add_argument("--chroma-server", type=str, default=DEFAULT_CHROMA_SERVER,
+                        help=f"ChromaDB server URL (default: {DEFAULT_CHROMA_SERVER}). "
+                             "Falls back to local --db-path if unreachable.")
     parser.add_argument("--embedding-model", type=str, default="all-MiniLM-L6-v2", help="Sentence transformer model")
     parser.add_argument("--top-k", type=int, default=3, help="Number of documents to retrieve")
     parser.add_argument("--max-tokens", type=int, default=512, help="Max tokens for response")
@@ -123,7 +143,7 @@ if __name__ == "__main__":
     model = SentenceTransformer(args.embedding_model)
 
     print("Connecting to ChromaDB...")
-    client = chromadb.PersistentClient(path=args.db_path)
+    client = _connect_chroma(args.chroma_server, args.db_path)
     try:
         collection = client.get_collection(name=args.collection)
     except ValueError:

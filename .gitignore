@@ -45,3 +45,12 @@ poetry.toml
 
 build/
 logs/
+rag/chroma_db/chroma.sqlite3
+rag/sampling_data/jsonified/96.json
+rag/sampling_data/jsonified/C900.json
+rag/sampling_data/jsonified/NG9-3.json
+rag/sampling_data/jsonified/NG9-5.json
+rag/sampling_data/jsonified/original/96.md
+rag/sampling_data/jsonified/original/C900.md
+rag/sampling_data/jsonified/original/NG9-3.md
+rag/sampling_data/jsonified/original/NG9-5.md
